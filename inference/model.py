@@ -423,6 +423,8 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
+    if True:
+        return x
     from fast_hadamard_transform import hadamard_transform
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size ** -0.5)
