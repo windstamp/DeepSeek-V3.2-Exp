@@ -451,6 +451,36 @@ class Indexer(torch.nn.Module):
         self.register_buffer("k_scale_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim // block_size, dtype=torch.float32), persistent=False)
 
 
+    def forward2(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+        q = self.wq_b(qr)
+        q = rearrange(q, 'b s (h d) -> b s h d', d=self.head_dim)
+        q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        k = self.wk(x)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2)
+        k = torch.cat([k_pe, k_nope], dim=-1)
+        q = rotate_activation(q)
+        k = rotate_activation(k)
+        q_fp8, q_scale = act_quant(q, block_size, self.scale_fmt)
+        k_fp8, k_scale = act_quant(k, block_size, self.scale_fmt)
+        self.k_cache[:bsz, start_pos:end_pos] = k_fp8
+        self.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
+        weights = self.weights_proj(x) * self.n_heads ** -0.5
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
+        if mask is not None:
+            index_score += mask
+        topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+        topk_indices_ = topk_indices.clone()
+        dist.broadcast(topk_indices_, src=0)
+        assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
+        return topk_indices
+
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
@@ -466,6 +496,25 @@ class Indexer(torch.nn.Module):
         k = torch.cat([k_pe, k_nope], dim=-1)
         q = rotate_activation(q)
         k = rotate_activation(k)
+
+        # CPU fallback: compute index scores without FP8/Tensor cores
+#        if not torch.cuda.is_available():
+        if True:
+            # weights: (b, m, h)
+            weights = self.weights_proj(x) * self.n_heads ** -0.5
+            # logits per head: (b, m, n, h)
+            logits = torch.einsum("bmhd,bnd->bmhn", q, k).relu()
+            # sum over heads with weights -> (b, m, n)
+            index_score = torch.einsum("bmhn,bmh->bmn", logits, weights) * self.softmax_scale
+            if mask is not None:
+                index_score += mask
+            topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+            topk_indices_ = topk_indices.clone()
+            # dist.broadcast(topk_indices_, src=0)
+            assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
+            return topk_indices
+
+        # ...existing code...
         q_fp8, q_scale = act_quant(q, block_size, self.scale_fmt)
         k_fp8, k_scale = act_quant(k, block_size, self.scale_fmt)
         self.k_cache[:bsz, start_pos:end_pos] = k_fp8
