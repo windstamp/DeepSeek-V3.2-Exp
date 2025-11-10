@@ -53,15 +53,15 @@ class ModelArgs:
         index_head_dim (int): Dimension for index head.
         index_topk (int): Top-k for index head.
     """
-    max_batch_size: int = 8
-    max_seq_len: int = 4096 * 4
+    max_batch_size: int = 2
+    max_seq_len: int = 2048
     dtype: Literal["bf16", "fp8"] = "bf16"
     scale_fmt: Optional[str] = None
     vocab_size: int = 102400
     dim: int = 2048
     inter_dim: int = 10944
     moe_inter_dim: int = 1408
-    n_layers: int = 27
+    n_layers: int = 8
     n_dense_layers: int = 1
     n_heads: int = 16
     # moe
