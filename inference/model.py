@@ -8,8 +8,19 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, fp8_gemm, fp8_index
-
+# from kernel import act_quant, fp8_gemm, fp8_index
+def _load_kernels() -> bool:
+    """Lazy import GPU/FP8 kernels; return True on success, False otherwise."""
+    global act_quant, fp8_gemm, fp8_index, _KERNELS_OK
+    if globals().get("_KERNELS_OK", False):
+        return True
+    try:
+        from kernel import act_quant, fp8_gemm, fp8_index  # type: ignore
+        _KERNELS_OK = True
+        return True
+    except Exception:
+        _KERNELS_OK = False
+        return False
 
 world_size = 1
 rank = 0
@@ -54,34 +65,34 @@ class ModelArgs:
         index_topk (int): Top-k for index head.
     """
     max_batch_size: int = 8
-    max_seq_len: int = 4096 * 4
+    max_seq_len: int = 256
     dtype: Literal["bf16", "fp8"] = "bf16"
     scale_fmt: Optional[str] = None
-    vocab_size: int = 102400
-    dim: int = 2048
-    inter_dim: int = 10944
-    moe_inter_dim: int = 1408
-    n_layers: int = 27
-    n_dense_layers: int = 1
-    n_heads: int = 16
+    vocab_size: int = 8192
+    dim: int = 256
+    inter_dim: int = 1024
+    moe_inter_dim: int = 256
+    n_layers: int = 2
+    n_dense_layers: int = 2
+    n_heads: int = 4
     # moe
-    n_routed_experts: int = 64
-    n_shared_experts: int = 2
-    n_activated_experts: int = 6
+    n_routed_experts: int = 4
+    n_shared_experts: int = 1
+    n_activated_experts: int = 1
     n_expert_groups: int = 1
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
     route_scale: float = 1.
     # mla
     q_lora_rank: int = 0
-    kv_lora_rank: int = 512
-    qk_nope_head_dim: int = 128
-    qk_rope_head_dim: int = 64
-    v_head_dim: int = 128
+    kv_lora_rank: int = 64
+    qk_nope_head_dim: int = 32
+    qk_rope_head_dim: int = 32
+    v_head_dim: int = 64
     # yarn
-    original_seq_len: int = 4096
+    original_seq_len: int = 256
     rope_theta: float = 10000.0
-    rope_factor: float = 40
+    rope_factor: float = 2.0
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.
@@ -160,6 +171,9 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     if weight.dtype != torch.float8_e4m3fn:
         return F.linear(x, weight)
     else:
+        if not _load_kernels():
+            raise RuntimeError("FP8 kernels unavailable (CUDA/tilelang not found). "
+                               "Use bf16 on CPU: set ModelArgs.dtype='bf16'.")
         x, scale = act_quant(x, block_size, scale_fmt)
         return fp8_gemm(x, scale, weight, weight.scale)
 
@@ -423,6 +437,8 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
+    if True:
+        return x
     from fast_hadamard_transform import hadamard_transform
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size ** -0.5)
@@ -445,9 +461,39 @@ class Indexer(torch.nn.Module):
         self.softmax_scale = self.head_dim ** -0.5
         self.scale_fmt = args.scale_fmt
 
-        self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim, dtype=torch.float8_e4m3fn), persistent=False)
+        self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim, dtype=torch.bfloat16), persistent=False)
         self.register_buffer("k_scale_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim // block_size, dtype=torch.float32), persistent=False)
 
+
+    def forward2(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+        q = self.wq_b(qr)
+        q = rearrange(q, 'b s (h d) -> b s h d', d=self.head_dim)
+        q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        k = self.wk(x)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2)
+        k = torch.cat([k_pe, k_nope], dim=-1)
+        q = rotate_activation(q)
+        k = rotate_activation(k)
+        q_fp8, q_scale = act_quant(q, block_size, self.scale_fmt)
+        k_fp8, k_scale = act_quant(k, block_size, self.scale_fmt)
+        self.k_cache[:bsz, start_pos:end_pos] = k_fp8
+        self.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
+        weights = self.weights_proj(x) * self.n_heads ** -0.5
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
+        if mask is not None:
+            index_score += mask
+        topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+        topk_indices_ = topk_indices.clone()
+        dist.broadcast(topk_indices_, src=0)
+        assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
+        return topk_indices
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         bsz, seqlen, _ = x.size()
@@ -464,6 +510,25 @@ class Indexer(torch.nn.Module):
         k = torch.cat([k_pe, k_nope], dim=-1)
         q = rotate_activation(q)
         k = rotate_activation(k)
+
+        # CPU fallback: compute index scores without FP8/Tensor cores
+#        if not torch.cuda.is_available():
+        if True:
+            # weights: (b, m, h)
+            weights = self.weights_proj(x) * self.n_heads ** -0.5
+            # logits per head: (b, m, n, h)
+            logits = torch.einsum("bmhd,bnd->bmhn", q, k).relu()
+            # sum over heads with weights -> (b, m, n)
+            index_score = torch.einsum("bmhn,bmh->bmn", logits, weights) * self.softmax_scale
+            if mask is not None:
+                index_score += mask
+            topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+            topk_indices_ = topk_indices.clone()
+            # dist.broadcast(topk_indices_, src=0)
+            assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
+            return topk_indices
+
+        # ...existing code...
         q_fp8, q_scale = act_quant(q, block_size, self.scale_fmt)
         k_fp8, k_scale = act_quant(k, block_size, self.scale_fmt)
         self.k_cache[:bsz, start_pos:end_pos] = k_fp8
@@ -904,7 +969,7 @@ class Transformer(nn.Module):
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
+    torch.set_default_device("cpu")
     torch.manual_seed(0)
     args = ModelArgs()
     x = torch.randint(0, args.vocab_size, (2, 128))
