@@ -107,6 +107,7 @@ class ParallelEmbedding(nn.Module):
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+        # print(f'self.weight: {self.weight.shape} {self.weight.dtype} {self.weight.device}')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -121,11 +122,13 @@ class ParallelEmbedding(nn.Module):
         Raises:
             ValueError: If `world_size` is not defined.
         """
+        # print(f'x: {x.shape} {x.dtype} {x.device}')
         if world_size > 1:
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
             x = x - self.vocab_start_idx
             x[mask] = 0
         y = F.embedding(x, self.weight)
+        # print(f'y: {y.shape} {y.dtype} {y.device}')
         if world_size > 1:
             y[mask] = 0
             dist.all_reduce(y)
@@ -881,13 +884,28 @@ class Block(nn.Module):
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
+        # print(f'x: {x.shape} {x.dtype} {x.device}')
+        # if residual is not None:
+        #     print(f'residual: {residual.shape} {residual.dtype} {residual.device}')
+        # print(f'start_pos: {start_pos}')
+        # print(f'freqs_cis: {freqs_cis.shape} {freqs_cis.dtype} {freqs_cis.device}')
+        # print(f'mask: {mask.shape} {mask.dtype} {mask.device}')
         if residual is None:
             x, residual = self.attn_norm(x), x
+            # print(f'x: {x.shape} {x.dtype} {x.device}')
+            # print(f'residual: {residual.shape} {residual.dtype} {residual.device}')
         else:
             x, residual = self.attn_norm(x, residual)
+            # print(f'x: {x.shape} {x.dtype} {x.device}')
+            # print(f'residual: {residual.shape} {residual.dtype} {residual.device}')
         x = self.attn(x, start_pos, freqs_cis, mask)
+        # print(f'x: {x.shape} {x.dtype} {x.device}')
         x, residual = self.ffn_norm(x, residual)
+        # print(f'x: {x.shape} {x.dtype} {x.device}')
+        # print(f'residual: {residual.shape} {residual.dtype} {residual.device}')
         x = self.ffn(x)
+        # print(f'x: {x.shape} {x.dtype} {x.device}')
+        # print(f'residual: {residual.shape} {residual.dtype} {residual.device}')
         return x, residual
 
 
@@ -915,6 +933,8 @@ class Transformer(nn.Module):
         rank = dist.get_rank() if dist.is_initialized() else 0
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         Linear.scale_fmt = args.scale_fmt
+        # print(f'world_size: {world_size}, rank: {rank}')
+        # print(f'Linear.dtype: {Linear.dtype}, Linear.scale_fmt: {Linear.scale_fmt}')
         super().__init__()
         self.max_seq_len = args.max_seq_len
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
@@ -938,14 +958,23 @@ class Transformer(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
+        # print(f'tokens: {tokens.shape} {tokens.dtype} {tokens.device}')
         seqlen = tokens.size(1)
+        # print(f'seqlen: {seqlen}')
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        # print(f'freqs_cis: {freqs_cis.shape} {freqs_cis.dtype} {freqs_cis.device}')
         mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1) if seqlen > 1 else None
+        # print(f'mask: {mask.shape} {mask.dtype} {mask.device}')
         h, residual = self.embed(tokens), None
+        # print(f'h: {h.shape} {h.dtype} {h.device}')
         for layer in self.layers:
             h, residual = layer(h, residual, start_pos, freqs_cis, mask)
+            # print(f'h: {h.shape} {h.dtype} {h.device}')
+            # print(f'residual: {residual.shape} {residual.dtype} {residual.device}')
         h, _ = self.norm(h, residual)
+        # print(f'h: {h.shape} {h.dtype} {h.device}')
         logits = self.head(h[:, -1].float())
+        # print(f'logits: {logits.shape} {logits.dtype} {logits.device}')
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
@@ -954,10 +983,13 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
+    import sys
+    print(f"{__file__}:{sys._getframe().f_lineno}")
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
     args = ModelArgs()
     x = torch.randint(0, args.vocab_size, (2, 128))
+    print(f'x: {x.shape} {x.dtype} {x.device}')
     model = Transformer(args)
     print(model(x).size())
