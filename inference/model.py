@@ -968,10 +968,13 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
+    import sys
+    print(f"{__file__}:{sys._getframe().f_lineno}")
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cpu")
     torch.manual_seed(0)
     args = ModelArgs()
     x = torch.randint(0, args.vocab_size, (2, 128))
+    print(f'x: {x.shape} {x.dtype} {x.device}')
     model = Transformer(args)
     print(model(x).size())
